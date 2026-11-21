@@ -279,6 +279,27 @@ void RR_SIM::pick_jobs_to_run(double reltime) {
                 rsc_pwf.pending_iter = rsc_pwf.pending.erase(
                     rsc_pwf.pending_iter
                 );
+            } else if (have_max_concurrent
+                && max_concurrent_exceeded(rp) == CONCURRENT_LIMIT_APP
+            ) {
+                // This job can't start yet because its app is at its
+                // max_concurrent limit.  Skip it, but keep simulating
+                // the project's other apps (they may have no limit).
+                //
+                // Record the time.  If jobs are still being held back
+                // by a limit at the end of the work buffer, the project
+                // already has more work than its limits let it run,
+                // and work fetch stops (see compute_rsc_project_reason()).
+                // Merely running at the limit doesn't count.
+                //
+                rsc_pwf.last_mc_limit_reltime = reltime;
+                if (log_flags.rr_simulation) {
+                    msg_printf(p, MSG_INFO,
+                        "[rr_sim] %s held back by app max concurrent; t %f",
+                        rp->name, reltime
+                    );
+                }
+                ++rsc_pwf.pending_iter;
             } else {
                 // add job to active_jobs list, and adjust project priority
                 //
@@ -309,18 +330,9 @@ void RR_SIM::pick_jobs_to_run(double reltime) {
                             );
                         }
                         break;
-                    case CONCURRENT_LIMIT_APP:
-                        // no more jobs for this project/app
-                        //
-                        p->pwf.at_max_concurrent_limit = true;
-                        rsc_pwf.last_mc_limit_reltime = reltime;
-                        if (log_flags.rr_simulation) {
-                            msg_printf(p, MSG_INFO,
-                                "[rr_sim] at app max concurrent for %s; t %f",
-                                rp->app->name, reltime
-                            );
-                        }
-                        break;
+                    // CONCURRENT_LIMIT_APP: nothing to do here.
+                    // Further jobs of this app are skipped above
+                    // when we reach them.
                     }
                 }
 

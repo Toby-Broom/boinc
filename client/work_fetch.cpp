@@ -33,6 +33,8 @@
 #include "result.h"
 #include "scheduler_op.h"
 
+#include <map>
+
 #include "work_fetch.h"
 
 using std::vector;
@@ -73,27 +75,65 @@ void RSC_PROJECT_WORK_FETCH::rr_init(PROJECT *p) {
     mc_shortfall = 0;
     last_mc_limit_reltime = 0;
     if (p->app_configs.project_has_mc) {
-        // compute x = max usage over this resource over P's app versions
-        double x = 1;   // in case there are no app versions
-        for (APP_VERSION* avp: gstate.app_versions) {
-            if (avp->project != p) continue;
-            if (rsc_type && (avp->resource_usage.rsc_type == rsc_type)) {
-                if (avp->resource_usage.coproc_usage > x) x = avp->resource_usage.coproc_usage;
-            } else {
-                if (avp->resource_usage.avg_ncpus > x) x = avp->resource_usage.avg_ncpus;
-            }
-        }
-
-        // max instances this project could use is (approximately)
-        // its smallest max concurrent limit times x
-        // This doesn't take into account e.g. that the MC limit
-        // could be from a different app than the one that determined x
-        //
-        mc_max_could_use = std::min(
-            p->app_configs.project_min_mc*x,
-            (double)(rsc_work_fetch[rsc_type].ninstances)
-        );
+        mc_max_could_use = mc_max_usage(p);
     }
+}
+
+// Estimate the max # of instances of this resource that project P
+// could use, given max_concurrent limits in its app_config.xml.
+//
+// Do this per app: an app with a limit can use at most
+// (limit x largest usage of its versions on this resource);
+// an app with no limit can use all instances.
+// Previously we used (smallest limit of any app) x (largest usage of
+// any app version), so one app with a low limit stopped work fetch
+// for the whole project even if its other apps had no limit.
+//
+double RSC_PROJECT_WORK_FETCH::mc_max_usage(PROJECT *p) {
+    double ninst = (double)(rsc_work_fetch[rsc_type].ninstances);
+
+    // max usage of this resource, per app and over all of P's app versions
+    //
+    std::map<APP*, double> app_usage;
+    double max_usage = 0;
+    for (APP_VERSION* avp: gstate.app_versions) {
+        if (avp->project != p) continue;
+        if (avp->resource_usage.rsc_type != rsc_type) continue;
+        double u = rsc_type
+            ? avp->resource_usage.coproc_usage
+            : avp->resource_usage.avg_ncpus;
+        if (u <= 0) continue;
+        double& au = app_usage[avp->app];
+        if (u > au) au = u;
+        if (u > max_usage) max_usage = u;
+    }
+    if (app_usage.empty()) {
+        // no app versions for this resource yet;
+        // don't let max_concurrent block the first fetch
+        //
+        return ninst;
+    }
+
+    double could_use = 0;
+    for (const auto& it: app_usage) {
+        APP* app = it.first;
+        double usage = it.second;
+        if (!app->max_concurrent) {
+            // an app with no limit could use everything
+            //
+            could_use = ninst;
+            break;
+        }
+        could_use += app->max_concurrent * usage;
+    }
+
+    // a project-wide limit also caps the total
+    //
+    int pmc = p->app_configs.project_max_concurrent;
+    if (pmc) {
+        could_use = std::min(could_use, pmc*max_usage);
+    }
+    return std::min(could_use, ninst);
 }
 
 void RSC_PROJECT_WORK_FETCH::resource_backoff(PROJECT* p, const char* name) {
